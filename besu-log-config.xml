@@ -12,7 +12,7 @@
         </Console>
         <RollingFile name="EstimateGasCall" fileName="/data/besu/estimate-gas-call.csv"
                      filePattern="/data/besu/estimate-gas-call-%d{yyyy-MM-dd}.csv.gz">
-            <PatternLayout pattern="%X{tx}|%X{client}|%X{gasEstimation}|%X{request}|%X{response}%n"/>
+	<PatternLayout pattern="%X{tx}|%X{client}|%X{ifid}|%X{gasEstimation}|%X{request}|%X{response}%n"/>
             <Policies>
                 <OnStartupTriggeringPolicy/>
                 <TimeBasedTriggeringPolicy/>
@@ -20,7 +20,7 @@
         </RollingFile>
         <RollingFile name="ConfirmedGasUsed" fileName="/data/besu/confirmed-gas-used.csv"
                      filePattern="/data/besu/confirmed-gas-used-%d{yyyy-MM-dd}.csv.gz">
-            <PatternLayout pattern="%X{tx}|%X{client}|%X{gasEstimation}|%X{gasUsed}|%X{diff}|%X{errorResponse}%n"/>
+	<PatternLayout pattern="%X{tx}|%X{client}|%X{ifid}|%X{gasEstimation}|%X{gasUsed}|%X{diff}|%X{errorResponse}%n"/>
             <Policies>
                 <OnStartupTriggeringPolicy/>
                 <TimeBasedTriggeringPolicy/>

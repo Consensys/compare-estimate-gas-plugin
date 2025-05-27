@@ -19,12 +19,14 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.SequencedMap;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executors;
@@ -37,6 +39,12 @@ public class EstimateGasComparator implements BesuPlugin, BesuEvents.Transaction
   private final static Logger log = LoggerFactory.getLogger(EstimateGasComparator.class);
   private final static AtomicLong id = new AtomicLong();
   private final static HttpClient httpClient = HttpClient.newBuilder().build();
+  private final static Map<Integer, Set<String>> includeFieldsMap = Map.of(
+      0, Set.of("from", "to", "nonce", "value", "input", "gasPrice"),
+      1, Set.of("from", "to", "value", "input", "gasPrice"),
+      2, Set.of("from", "to", "value", "input"),
+      3, Set.of("from", "to", "input")
+  );
   @CommandLine.Option(
       names = {"--plugin-ceg-endpoints"},
       paramLabel = "<MAP<NAME,URI>>",
@@ -68,9 +76,9 @@ public class EstimateGasComparator implements BesuPlugin, BesuEvents.Transaction
     Executors.newSingleThreadExecutor().submit(() -> {
       while (!stopped) {
         try {
-          var tx = getPendingTransaction();
+          var maybeTx = getPendingTransaction();
 
-          if (tx.isEmpty()) {
+          if (maybeTx.isEmpty()) {
             try {
               Thread.sleep(1000);
             } catch (InterruptedException e) {
@@ -78,7 +86,8 @@ public class EstimateGasComparator implements BesuPlugin, BesuEvents.Transaction
               break;
             }
           } else {
-            compareEstimateGas(tx.get());
+            var tx = maybeTx.get();
+            gasEstimationsByTx.put(tx.getHash(), compareEstimateGas(tx));
           }
         } catch (Exception e) {
           log.error("Error comparing estimate gas", e);
@@ -87,44 +96,62 @@ public class EstimateGasComparator implements BesuPlugin, BesuEvents.Transaction
     });
   }
 
-  private void compareEstimateGas(final Transaction tx) {
-    var reqBody = createRequest(tx);
+  private List<GasEstimation> compareEstimateGas(final Transaction tx) {
+    var allResponses = includeFieldsMap.entrySet().stream().map(entry -> {
+      var includeFields = entry.getValue();
+      var ifid = entry.getKey();
 
-    log.trace("Request {} from tx {}", reqBody, tx);
+      var reqBody = createRequest(tx, includeFields);
 
-    var responses = endpointUrlsByName.values().parallelStream().map(uri ->
-        HttpRequest.newBuilder()
-            .uri(uri)
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(reqBody))
-            .build()
-    ).map(httpRequest -> {
-      try {
-        log.atDebug().setMessage("Calling {} for tx {}").addArgument(() -> getClient(httpRequest.uri())).addArgument(tx::getHash).log();
-        return httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
-      } catch (IOException | InterruptedException e) {
-        throw new RuntimeException(getClient(httpRequest.uri()), e);
-      }
-    }).map(response -> parseResponse(reqBody, response, tx))
-        .sorted(Comparator.comparing(GasEstimation::client)).toList();
+      log.trace("Request {} from tx {}, ifid {}", reqBody, tx, ifid);
 
-    var first = responses.get(0);
-    log.info("\n>\t{}\t{}\t{}", tx.getHash(), first.client, first.gasEstimation);
+      var responses = endpointUrlsByName.values().parallelStream().map(uri ->
+              HttpRequest.newBuilder()
+                  .uri(uri)
+                  .header("Content-Type", "application/json")
+                  .POST(HttpRequest.BodyPublishers.ofString(reqBody))
+                  .build()
+          ).map(httpRequest -> {
+            try {
+              log.atDebug()
+                  .setMessage("Calling {} for tx {}, ifid {}")
+                  .addArgument(() -> getClient(httpRequest.uri()))
+                  .addArgument(tx::getHash)
+                  .addArgument(ifid)
+                  .log();
+              return httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+            } catch (IOException | InterruptedException e) {
+              throw new RuntimeException(getClient(httpRequest.uri()), e);
+            }
+          }).map(response -> parseResponse(ifid, reqBody, response, tx))
+          .sorted(Comparator.comparing(GasEstimation::client)).toList();
 
-    responses.stream().skip(1)
-        .filter(r -> r.gasEstimation != first.gasEstimation)
-        .forEach(r ->
-            log.warn("\n!\t{}\t{}\t{} != {}", tx.getHash(), r.client, r.gasEstimation, first.gasEstimation)
-        );
+      var first = responses.get(0);
+      log.info("\n>\t{}\t{}\t{}\t{}", tx.getHash(), first.client, ifid, first.gasEstimation);
 
-    gasEstimationsByTx.put(tx.getHash(), responses);
+      responses.stream().skip(1)
+          .filter(r -> r.gasEstimation != first.gasEstimation)
+          .forEach(r ->
+              log.warn("\n!\t{}\t{}\t{}\t{} != {}", tx.getHash(), r.client, ifid, r.gasEstimation, first.gasEstimation)
+          );
+
+      return responses;
+    })
+        .reduce(new ArrayList<>(), (a, b) -> {
+      a.addAll(b);
+      return a;
+    });
+
+    allResponses.sort(Comparator.comparing(GasEstimation::ifid).thenComparing(GasEstimation::client));
+
+    return allResponses;
   }
 
   private String getClient(final URI uri) {
     return endpointUrlsByName.entrySet().stream().filter(e -> e.getValue().equals(uri)).findFirst().map(Map.Entry::getKey).orElseThrow();
   }
 
-  private GasEstimation parseResponse(final String reqBody, final HttpResponse<String> response, final Transaction transaction) {
+  private GasEstimation parseResponse(final Integer ifid, final String reqBody, final HttpResponse<String> response, final Transaction transaction) {
     var respBody = response.body().trim();
     long gasEstimation;
     if (respBody.contains("result")) {
@@ -149,27 +176,39 @@ public class EstimateGasComparator implements BesuPlugin, BesuEvents.Transaction
         .addKeyValue("request", reqBody.trim())
         .addKeyValue("response", respBody.trim())
         .addKeyValue("client", client)
+        .addKeyValue("ifid", ifid)
         .addKeyValue("gasEstimation", gasEstimation)
         .log();
 
-    return new GasEstimation(getClient(response.request().uri()), gasEstimation, gasEstimation == -1 ? respBody : null);
+    return new GasEstimation(getClient(response.request().uri()), ifid, gasEstimation, gasEstimation == -1 ? respBody : null);
   }
 
-  private String createRequest(final Transaction tx) {
-    var sb = new StringBuilder("""
-        "from":"%s","value":"%s","input":"%s" """.formatted(
-        tx.getSender().toHexString(),
-        tx.getValue().toShortHexString(),
-        tx.getPayload().toHexString()
-    ));
-    tx.getTo().ifPresent(to -> sb.append(",\"to\":\"" + to.toHexString() + "\""));
-    tx.getGasPrice().ifPresent(gasPrice -> sb.append(",\"gasPrice\":\"" + gasPrice.toShortHexString() + "\""));
-    tx.getMaxFeePerGas().ifPresent(quantity -> sb.append(",\"maxFeePerGas\":\"" + quantity.toShortHexString() + "\""));
-    tx.getMaxPriorityFeePerGas().ifPresent(quantity -> sb.append(",\"maxPriorityFeePerGas\":\"" + quantity.toShortHexString() + "\""));
-    tx.getMaxFeePerBlobGas().ifPresent(quantity -> sb.append(",\"maxFeePerBlobGas\":\"" + quantity.toShortHexString() + "\""));
+  private String createRequest(final Transaction tx, final Set<String> includeFields) {
+    final List<String> reqParts = new ArrayList<>();
+    if(includeFields.contains("from")) {
+      reqParts.add("\"from\":\"" + tx.getSender().toHexString() + '"');
+    }
+    if(includeFields.contains("to")) {
+      tx.getTo().ifPresent(to -> reqParts.add("\"to\":\"" + to.toHexString() + '"'));
+    }
+    if(includeFields.contains("nonce")) {
+      reqParts.add("\"nonce\":\"0x" + Long.toHexString(tx.getNonce()) + '"');
+    }
+    if(includeFields.contains("value")) {
+      reqParts.add("\"value\":\"" + tx.getValue().toShortHexString() + '"');
+    }
+    if(includeFields.contains("input")) {
+      reqParts.add("\"input\":\"" + tx.getPayload().toHexString() + '"');
+    }
+    if(includeFields.contains("gasPrice")) {
+      tx.getGasPrice().ifPresent(gasPrice -> reqParts.add("\"gasPrice\":\"" + gasPrice.toShortHexString() + '"'));
+      tx.getMaxFeePerGas().ifPresent(quantity -> reqParts.add("\"maxFeePerGas\":\"" + quantity.toShortHexString() + '"'));
+      tx.getMaxPriorityFeePerGas().ifPresent(quantity -> reqParts.add("\"maxPriorityFeePerGas\":\"" + quantity.toShortHexString() + '"'));
+      tx.getMaxFeePerBlobGas().ifPresent(quantity -> reqParts.add("\"maxFeePerBlobGas\":\"" + quantity.toShortHexString() + '"'));
+    }
 
     return """
-        {"jsonrpc":"2.0","method":"eth_estimateGas","id":%d,"params": [{%s}]}""".formatted(id.incrementAndGet(), sb.toString());
+        {"jsonrpc":"2.0","method":"eth_estimateGas","id":%d,"params": [{%s}]}""".formatted(id.incrementAndGet(), String.join(",", reqParts));
   }
 
   private synchronized Optional<Transaction> getPendingTransaction() {
@@ -210,6 +249,7 @@ public class EstimateGasComparator implements BesuPlugin, BesuEvents.Transaction
                 .addMarker(CONFIRMED_GAS_USED)
                 .addKeyValue("tx", ctx.getHash())
                 .addKeyValue("client", e.client)
+                .addKeyValue("ifid", e.ifid)
                 .addKeyValue("gasEstimation", e.gasEstimation)
                 .addKeyValue("gasUsed", gasUsed)
                 .addKeyValue("diff", e.gasEstimation - gasUsed)
@@ -228,10 +268,10 @@ public class EstimateGasComparator implements BesuPlugin, BesuEvents.Transaction
     }
   }
 
-  record GasEstimation(String client, long gasEstimation, String errorResponse) {
+  record GasEstimation(String client, int ifid, long gasEstimation, String errorResponse) {
     @Override
     public String toString() {
-      return client + "=" + gasEstimation + (errorResponse != null ? " (" + errorResponse : ")");
+      return client + "[" + ifid + "]" + "=" + gasEstimation + (errorResponse != null ? " (" + errorResponse : ")");
     }
   }
 }
